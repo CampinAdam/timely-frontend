@@ -1,0 +1,123 @@
+stages:
+  - build
+  - test
+  - deploy
+  - release
+
+# Resources:
+# https://mohammed-abouzahr.medium.com/integration-test-starter-with-ci-5037410817ee
+# https://medium.com/devops-with-valentine/how-to-build-a-docker-image-and-push-it-to-the-gitlab-container-registry-from-a-gitlab-ci-pipeline-acac0d1f26df
+# https://stackoverflow.com/questions/71522171/how-to-keep-docker-image-build-during-job-across-two-stages-with-gitlab-ci
+# https://stackoverflow.com/questions/51857634/cannot-connect-to-the-docker-daemon-at-unix-var-run-docker-sock-is-the-docke
+# https://docs.gitlab.com/ee/user/project/releases/release_cicd_examples.html#create-a-release-when-a-commit-is-merged-to-the-default-branch
+# https://docs.gitlab.com/ee/ci/jobs/job_control.html#common-if-clauses-for-rules
+#
+# https://www.digitalocean.com/community/tutorials/how-to-set-up-a-continuous-deployment-pipeline-with-gitlab-ci-cd-on-ubuntu-18-04
+# https://stackoverflow.com/questions/1778088/how-do-i-clone-a-single-branch-in-git
+
+variables:
+  TAG_LATEST: $CI_REGISTRY_IMAGE/timely-backend-web:latest
+  TAG_COMMIT: $CI_REGISTRY_IMAGE/timely-backend-web:$CI_COMMIT_SHORT_SHA
+
+setup-job:
+  stage: .pre
+  # Start of section needed for docker-in-docker
+  image:
+    name: capstone-cs.eng.utah.edu:5050/timely/timely/dockercompose:latest
+  services:
+    - name: docker:dind
+      alias: dockerhost
+  variables:
+    DOCKER_HOST: tcp://dockerhost:2375/
+    DOCKER_DRIVER: overlay2
+    DOCKER_TLS_CERTDIR: ""
+  # End of section needed for docker-in-docker
+  script:
+    - echo "starting tasks here"
+    - |
+      echo "Variables:"
+      echo "MYSQL_ROOT_PASSWORD = $MYSQL_ROOT_PASSWORD"
+      echo "MYSQL_DATABASE = $MYSQL_DATABASE"
+      echo "MYSQL_USER = $MYSQL_USER"
+      echo "MYSQL_PASSWORD = $MYSQL_PASSWORD"
+      echo "DJANGO_SUPERUSER_USERNAME = $DJANGO_SUPERUSER_USERNAME"
+      echo "DJANGO_SUPERUSER_EMAIL = $DJANGO_SUPERUSER_EMAIL"
+      echo "DJANGO_SUPERUSER_PASSWORD = $DJANGO_SUPERUSER_PASSWORD"
+      echo "GOOGLE_CLIENT_ID = $GOOGLE_CLIENT_ID"
+      echo "GOOGLE_SECRET = $GOOGLE_SECRET"
+    - docker info
+
+build-job:
+  stage: build
+  # Start of section needed for docker-in-docker
+  image:
+    name: capstone-cs.eng.utah.edu:5050/timely/timely/dockercompose:latest
+  services:
+    - name: docker:dind
+      alias: dockerhost
+  variables:
+    DOCKER_HOST: tcp://dockerhost:2375/
+    DOCKER_DRIVER: overlay2
+    DOCKER_TLS_CERTDIR: ""
+  # End of section needed for docker-in-docker
+  script:
+    # Some dependency that is installed with bc is used by the next line, but we don't know which
+    - apt-get install bc
+    - echo "This job tests building the docker image"
+    - docker build . -t flutter_docker
+    - sleep 2
+    - docker images
+    # Use David's magic to check if the image is listed by the 'docker images' command and was made in the last 60 seconds
+    - |
+      if [ $(docker images | grep flutter_docker | sed 's/^flutter_docker .* [a-zA-Z0-9]\{12\} \(.*\) .*$/\1/' | sed 's/\([0-9]\{1,10\}\) seconds\{0,1\} ago/\1/') -le 60 ]; then
+        echo "build succeeded"
+      else
+        exit 1
+      fi
+
+flutter-test-job:
+  stage: test
+  image:
+    name: capstone-cs.eng.utah.edu:5050/timely/timely/dockerflutter:latest
+  script:
+    - sh generate_env.sh
+    - find test -type f -regex '[^\.]*_test\.dart' -printf '%p\n' | cat > run_tests.sh
+    - sed -i "s|^|flutter test |" run_tests.sh
+    - sed -i '1s|^|#!\/bin\/sh\n\n|' run_tests.sh
+    - cat run_tests.sh
+    - echo "This job runs all test dart files in the test directory."
+    - sh run_tests.sh
+
+deploy-dev:
+  stage: deploy
+  script:
+    - echo "This job deploys commit $CI_COMMIT_SHA from the $CI_COMMIT_BRANCH branch."
+  environment:
+    name: development
+
+deploy-prod:
+  stage: deploy
+  image: alpine:latest
+  rules:                                             # Run this job only when:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH    #   - The pipeline is run on the default branch
+  script:
+    - echo "This job deploys commit $CI_COMMIT_SHA to the $CI_DEFAULT_BRANCH branch."
+  environment:
+    name: production                                 # Just deploy to 'production' environment for now
+
+release_job:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  rules:                                             # Run this job only when:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH    #   - The pipeline is run on the default branch
+  script:
+    - echo "running release_job, creating release $CI_PROJECT_NAME-v0.$CI_PIPELINE_IID from commit $CI_COMMIT_SHA"
+  release:                                           # See https://docs.gitlab.com/ee/ci/yaml/#release for available properties
+    tag_name: '$CI_PROJECT_NAME-v0.$CI_PIPELINE_IID' # The version is incremented per project.
+    description: 'Release $CI_PROJECT_NAME-v0.$CI_PIPELINE_IID from commit $CI_COMMIT_SHA'
+    ref: '$CI_COMMIT_SHA'                            # The tag is created from the pipeline SHA.
+
+final-job:
+  stage: .post
+  script:
+    - echo "ending tasks here"
